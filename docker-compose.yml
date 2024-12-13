@@ -2,23 +2,64 @@ version: '3.8'
 
 services:
   apigateway:
-    build: ./docker/apigateway
+    build: 
+      context: ./docker/apigateway
+      dockerfile: Dockerfile
     ports:
       - '8080:8080'
     networks:
       - frontend
       - backend
 
-  cloudwatch:
-    build: ./docker/cloudwatch
+  bedrock:
+    build: 
+      context: ./docker/bedrock
+      dockerfile: Dockerfile
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - MODEL_BASE_PATH=/models
+      - MODEL_CONFIG_PATH=/models/config
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - '5000:5000'
+    networks:
+      - backend
     volumes:
-      - metrics_data:/var/lib/cloudwatch
+      - type: bind
+        source: ./storage/models
+        target: /models
+      - type: bind
+        source: ./storage/cache
+        target: /root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  cloudwatch:
+    build:
+      context: ./docker/cloudwatch
+      dockerfile: Dockerfile
+    volumes:
+      - type: bind
+        source: ./storage/cloudwatch
+        target: /var/lib/cloudwatch
     networks:
       - backend
 
 networks:
   frontend:
+    driver: bridge
   backend:
-
-volumes:
-  metrics_data:
+    driver: bridge
