@@ -1,4 +1,4 @@
-version: '3.8'
+name: aws-local-infrastructure
 
 services:
   apigateway:
@@ -10,6 +10,8 @@ services:
     networks:
       - frontend
       - backend
+    volumes:
+      - ./docker/apigateway/src:/usr/src/app/src
 
   bedrock:
     build: 
@@ -35,12 +37,9 @@ services:
     networks:
       - backend
     volumes:
-      - type: bind
-        source: ./storage/models
-        target: /models
-      - type: bind
-        source: ./storage/cache
-        target: /root/.cache/huggingface
+      - ./docker/bedrock/src:/usr/src/app/src
+      - ./storage/models:/models
+      - ./storage/cache:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
@@ -52,11 +51,12 @@ services:
       context: ./docker/cloudwatch
       dockerfile: Dockerfile
     volumes:
-      - type: bind
-        source: ./storage/cloudwatch
-        target: /var/lib/cloudwatch
+      - ./docker/cloudwatch/src:/usr/src/app/src
+      - ./storage/cloudwatch:/var/lib/cloudwatch
     networks:
       - backend
+    ports:
+      - '9090:9090'
 
 networks:
   frontend:
