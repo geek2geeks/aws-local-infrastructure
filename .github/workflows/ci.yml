@@ -1,0 +1,185 @@
+name: CI
+
+# Public repository: only trusted triggers (no pull_request / pull_request_target),
+# because every job runs on the Owner's self-hosted Windows runner.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  CI_COMPOSE_PROJECT: aws-local-infrastructure-ci
+
+jobs:
+  powershell:
+    name: PowerShell scripts parse
+    runs-on: [self-hosted, Windows, X64, aws-local-infrastructure]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Parse PowerShell scripts
+        run: |
+          $files = @('initialize-storage.ps1', 'start-services.ps1', 'modules/Common.psm1')
+          $failed = $false
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            $path = (Resolve-Path -LiteralPath $file).Path
+            [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              foreach ($e in $errors) {
+                Write-Host "::error file=$file,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+              $failed = $true
+            } else {
+              Write-Host "OK: $file"
+            }
+          }
+          if ($failed) { exit 1 }
+
+  node:
+    name: Node services
+    runs-on: [self-hosted, Windows, X64, aws-local-infrastructure]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # node:18 is the runtime declared by docker/apigateway/Dockerfile and
+      # docker/cloudwatch/Dockerfile. Bumping it is an Owner decision.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+          cache: npm
+          cache-dependency-path: docker/apigateway/package-lock.json
+
+      - name: Install apigateway dependencies
+        working-directory: docker/apigateway
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax check apigateway server
+        run: node --check docker/apigateway/src/server.js
+
+      # The repo has no test files yet. --passWithNoTests only tolerates the
+      # empty suite; a real failing test still fails the job.
+      - name: Test apigateway
+        working-directory: docker/apigateway
+        run: npm test -- --passWithNoTests
+
+      # No package-lock.json in docker/cloudwatch yet, so npm ci is impossible.
+      - name: Install cloudwatch dependencies
+        working-directory: docker/cloudwatch
+        run: npm install --no-package-lock --no-audit --no-fund
+
+      - name: Syntax check cloudwatch server
+        run: node --check docker/cloudwatch/src/server.js
+
+      - name: Test cloudwatch
+        working-directory: docker/cloudwatch
+        run: npm test -- --passWithNoTests
+
+  python:
+    name: Python service
+    runs-on: [self-hosted, Windows, X64, aws-local-infrastructure]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      # Syntax only: requirements.txt pulls torch/CUDA and is not installed here.
+      - name: Byte-compile bedrock sources
+        run: python -m py_compile docker/bedrock/src/server.py docker/bedrock/src/nvml_monitor.py
+
+      - name: Validate bedrock model config JSON
+        run: Get-Content -LiteralPath docker/bedrock/src/config/model_config.json -Raw | ConvertFrom-Json | Out-Null
+
+  docker:
+    name: Docker images and health
+    runs-on: [self-hosted, Windows, X64, aws-local-infrastructure]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate compose configuration
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker compose -p $env:CI_COMPOSE_PROJECT -f docker-compose.yml -f .github/ci/compose.ci.yml config --quiet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # bedrock is excluded on purpose: it needs an NVIDIA GPU runtime and a
+      # multi-GB CUDA base image (see CICD-AUDIT.md).
+      - name: Build service images
+        run: |
+          docker compose -p $env:CI_COMPOSE_PROJECT -f docker-compose.yml -f .github/ci/compose.ci.yml build apigateway cloudwatch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Start services
+        run: |
+          docker compose -p $env:CI_COMPOSE_PROJECT -f docker-compose.yml -f .github/ci/compose.ci.yml up -d --wait apigateway cloudwatch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test health endpoints
+        run: |
+          $checks = @(
+            @{ Name = 'apigateway'; Url = 'http://127.0.0.1:18080/health' },
+            @{ Name = 'cloudwatch'; Url = 'http://127.0.0.1:19090/health' }
+          )
+          foreach ($check in $checks) {
+            $deadline = (Get-Date).AddSeconds(120)
+            $healthy = $false
+            while ((Get-Date) -lt $deadline -and -not $healthy) {
+              try {
+                $response = Invoke-RestMethod -Uri $check.Url -TimeoutSec 5
+                if ($response.status -eq 'healthy') {
+                  Write-Host "$($check.Name): healthy"
+                  $healthy = $true
+                } else {
+                  Start-Sleep -Seconds 2
+                }
+              } catch {
+                Start-Sleep -Seconds 2
+              }
+            }
+            if (-not $healthy) {
+              Write-Host "::error::$($check.Name) did not report healthy at $($check.Url)"
+              exit 1
+            }
+          }
+
+      - name: Tear down CI stack
+        if: always()
+        run: |
+          docker compose -p $env:CI_COMPOSE_PROJECT -f docker-compose.yml -f .github/ci/compose.ci.yml down -v --remove-orphans
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "docker compose down exited with $LASTEXITCODE"
+          }
+          exit 0

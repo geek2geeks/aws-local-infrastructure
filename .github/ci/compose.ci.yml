@@ -1,0 +1,14 @@
+# CI-only override, used with:
+#   docker compose -p aws-local-infrastructure-ci -f docker-compose.yml -f .github/ci/compose.ci.yml ...
+#
+# The base file publishes 8080/9090 on all interfaces. That can clash with other
+# projects running on the shared runner, so CI replaces the ports with dedicated
+# loopback-only ones. !override requires Docker Compose >= 2.24.4.
+services:
+  apigateway:
+    ports: !override
+      - '127.0.0.1:18080:8080'
+
+  cloudwatch:
+    ports: !override
+      - '127.0.0.1:19090:9090'
