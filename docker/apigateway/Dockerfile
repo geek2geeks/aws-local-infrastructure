@@ -5,8 +5,8 @@ WORKDIR /usr/src/app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install
+# Install dependencies from the committed lockfile
+RUN npm ci
 
 # Copy source code
 COPY src/ ./src/

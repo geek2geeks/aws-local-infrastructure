@@ -10,6 +10,13 @@ __pycache__/
 dist/
 build/
 
+# Generated workspace snapshots (workspace.py)
+workspace_snapshot_*.md
+
+# Docker runtime data (bind mounts from docker-compose.yml)
+storage/models/
+storage/cloudwatch/
+
 # Logs
 *.log
 logs/
